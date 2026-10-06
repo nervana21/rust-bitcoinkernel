@@ -14,7 +14,9 @@
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <core_io.h>
+#include <crypto/sha256.h>
 #include <key_io.h>
+#include <logging.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
@@ -659,7 +661,9 @@ static void MutateTxSign(CMutableTransaction& tx, const std::string& flagStr)
                 UniValue v = prevOut["redeemScript"];
                 std::vector<unsigned char> rsData(ParseHexUV(v, "redeemScript"));
                 CScript redeemScript(rsData.begin(), rsData.end());
-                tempKeystore.AddCScript(redeemScript);
+                if (!tempKeystore.AddCScript(redeemScript)) {
+                    throw std::runtime_error(strprintf("Error adding redeemscript=%s", HexStr(redeemScript)));
+                }
             }
         }
     }
@@ -857,7 +861,9 @@ static int CommandLineRawTx(int argc, char* argv[])
 
 MAIN_FUNCTION
 {
+    BCLog::Logger logger;
     SetupEnvironment();
+    SHA256AutoDetect();
 
     try {
         int ret = AppInitRawTx(argc, argv);

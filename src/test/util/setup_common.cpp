@@ -17,7 +17,6 @@
 #include <dbwrapper.h>
 #include <init.h>
 #include <interfaces/chain.h>
-#include <interfaces/mining.h>
 #include <kernel/caches.h>
 #include <kernel/context.h>
 #include <key.h>
@@ -26,14 +25,17 @@
 #include <net_processing.h>
 #include <netbase.h>
 #include <netgroup.h>
+#include <node/block_template_manager.h>
 #include <node/blockstorage.h>
 #include <node/chainstate.h>
 #include <node/context.h>
+#include <node/kernel_mempool.h>
 #include <node/kernel_notifications.h>
 #include <node/miner.h>
 #include <node/mining_args.h>
 #include <node/mining_types.h>
 #include <node/peerman_args.h>
+#include <node/transaction.h>
 #include <node/warnings.h>
 #include <noui.h>
 #include <policy/feerate.h>
@@ -96,8 +98,11 @@
 #include <utility>
 
 using namespace util::hex_literals;
+using kernel::AbortFailure;
+using kernel::FlushResult;
 using node::ApplyArgsManOptions;
 using node::BlockManager;
+using node::KernelMempool;
 using node::KernelNotifications;
 using node::LoadChainstate;
 using node::RegenerateCommitments;
@@ -109,6 +114,8 @@ constexpr inline auto TEST_DIR_PATH_ELEMENT{"test_common bitcoin"}; // Includes 
 /** Random context to get unique temp data dirs. Separate from m_rng, which can be seeded from a const env var */
 static FastRandomContext g_rng_temp_path;
 static const bool g_rng_temp_path_init{[] {
+    // Make sure there is a global logger SeedStartup() can use.
+    BCLog::Logger logger;
     // Must be initialized before any SeedRandomForTest
     Assert(!g_used_g_prng);
     (void)g_rng_temp_path.rand64();
@@ -298,6 +305,7 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
     m_node.warnings = std::make_unique<node::Warnings>();
 
     m_node.notifications = std::make_unique<KernelNotifications>(Assert(m_node.shutdown_request), m_node.exit_status, *Assert(m_node.warnings));
+    m_node.mempool_interface = std::make_unique<KernelMempool>(*Assert(m_node.mempool));
 
     m_make_chainman = [this, &chainparams, opts] {
         Assert(!m_node.chainman);
@@ -305,10 +313,13 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
             .chainparams = chainparams,
             .datadir = m_args.GetDataDirNet(),
             .check_block_index = 1,
+            .mempool_interface = *m_node.mempool_interface,
             .notifications = *m_node.notifications,
             .signals = m_node.validation_signals.get(),
-            // Use no worker threads while fuzzing to avoid non-determinism
+            // Use no worker threads while fuzzing to avoid racy non-determinism
+            // and dangling thread handles if AFL forks after initialization.
             .worker_threads_num = EnableFuzzDeterminism() ? 0 : 2,
+            .prevoutfetch_threads_num = EnableFuzzDeterminism() ? 0 : 2,
         };
         if (opts.min_validation_cache) {
             chainman_opts.script_execution_cache_bytes = 0;
@@ -317,30 +328,36 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
         const BlockManager::Options blockman_opts{
             .chainparams = chainman_opts.chainparams,
             .blocks_dir = m_args.GetBlocksDirPath(),
+            .block_tree_dir = m_args.GetDataDirNet() / "blocks" / "index",
+            .wipe_block_tree_data = m_args.GetBoolArg("-reindex", false),
             .notifications = chainman_opts.notifications,
-            .block_tree_db_params = DBParams{
-                .path = m_args.GetDataDirNet() / "blocks" / "index",
-                .cache_bytes = m_kernel_cache_sizes.block_tree_db,
-                .memory_only = opts.block_tree_db_in_memory,
-                .wipe_data = m_args.GetBoolArg("-reindex", false),
-            },
         };
-        m_node.chainman = std::make_unique<ChainstateManager>(*Assert(m_node.shutdown_signal), chainman_opts, blockman_opts);
+        m_node.chainman = std::make_unique<ChainstateManager>(m_logger, *Assert(m_node.shutdown_signal), chainman_opts, blockman_opts);
     };
     m_make_chainman();
+    CreateBlockTemplateManager();
+}
+
+void ChainTestingSetup::CreateBlockTemplateManager()
+{
+    auto mining_args{node::ReadMiningArgs(*Assert(m_node.args))};
+    Assert(mining_args);
+    Assert(!m_node.block_template_manager);
+    m_node.block_template_manager = std::make_unique<node::BlockTemplateManager>(*m_node.mempool, *m_node.chainman, *Assert(m_node.notifications), std::move(*mining_args));
 }
 
 ChainTestingSetup::~ChainTestingSetup()
 {
     if (m_node.scheduler) m_node.scheduler->stop();
     if (m_node.validation_signals) m_node.validation_signals->FlushBackgroundCallbacks();
+    m_node.block_template_manager.reset();
     m_node.connman.reset();
     m_node.banman.reset();
     m_node.addrman.reset();
     m_node.netgroupman.reset();
     m_node.args = nullptr;
     m_node.mempool.reset();
-    Assert(!m_node.fee_estimator); // Each test must create a local object, if they wish to use the fee_estimator
+    Assert(!m_node.fee_estimator_man); // Each test must create a local object, if they wish to use the fee_estimator_man
     m_node.chainman.reset();
     m_node.validation_signals.reset();
     m_node.scheduler.reset();
@@ -357,16 +374,17 @@ void ChainTestingSetup::LoadVerifyActivateChainstate()
     options.check_blocks = m_args.GetIntArg("-checkblocks", DEFAULT_CHECKBLOCKS);
     options.check_level = m_args.GetIntArg("-checklevel", DEFAULT_CHECKLEVEL);
     options.require_full_verification = m_args.IsArgSet("-checkblocks") || m_args.IsArgSet("-checklevel");
-    auto [status, error] = LoadChainstate(chainman, m_kernel_cache_sizes, options);
-    assert(status == node::ChainstateLoadStatus::SUCCESS);
+    auto load_result{LoadChainstate(chainman, m_kernel_cache_sizes, options)};
+    Assert(load_result);
 
-    std::tie(status, error) = VerifyLoadedChainstate(chainman, options);
-    assert(status == node::ChainstateLoadStatus::SUCCESS);
+    auto verify_result{VerifyLoadedChainstate(chainman, options)};
+    Assert(verify_result);
 
     m_node.notifications->setChainstateLoaded(true);
 
     BlockValidationState state;
-    if (!chainman.ActiveChainstate().ActivateBestChain(state)) {
+    auto activate_result{chainman.ActiveChainstate().ActivateBestChain(state)};
+    if (!activate_result) {
         throw std::runtime_error(strprintf("ActivateBestChain failed. (%s)", state.ToString()));
     }
 }
@@ -377,7 +395,6 @@ TestingSetup::TestingSetup(
     : ChainTestingSetup(chainType, opts)
 {
     m_coins_db_in_memory = opts.coins_db_in_memory;
-    m_block_tree_db_in_memory = opts.block_tree_db_in_memory;
     // Ideally we'd move all the RPC tests to the functional testing framework
     // instead of unit tests, but for now we need these here.
     RegisterAllCoreRPCCommands(tableRPC);
@@ -392,9 +409,6 @@ TestingSetup::TestingSetup(
                                                m_node.args->GetIntArg("-checkaddrman", 0));
     m_node.banman = std::make_unique<BanMan>(m_args.GetDataDirBase() / "banlist", nullptr, DEFAULT_MISBEHAVING_BANTIME);
     m_node.connman = std::make_unique<ConnmanTestMsg>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params()); // Deterministic randomness for tests.
-    auto mining_args{node::ReadMiningArgs(*m_node.args)};
-    Assert(mining_args);
-    m_node.mining_args = std::move(*mining_args);
     PeerManager::Options peerman_opts;
     ApplyArgsManOptions(*m_node.args, peerman_opts);
     peerman_opts.deterministic_rng = true;
@@ -445,13 +459,13 @@ CBlock TestChain100Setup::CreateBlock(
     const std::vector<CMutableTransaction>& txns,
     const CScript& scriptPubKey)
 {
-    auto mining{interfaces::MakeMining(m_node)};
-    auto block_template{mining->createNewBlock({
+    auto& block_template_manager{*Assert(m_node.block_template_manager)};
+    auto block_template{block_template_manager.CreateNewTemplate({
         .use_mempool = false,
         .coinbase_output_script = scriptPubKey,
-    }, /*cooldown=*/false)};
+    })};
     Assert(block_template);
-    CBlock block{block_template->getBlock()};
+    CBlock block{block_template->block};
 
     Assert(block.vtx.size() == 1);
     for (const CMutableTransaction& tx : txns) {
@@ -470,7 +484,9 @@ CBlock TestChain100Setup::CreateAndProcessBlock(
 {
     CBlock block = this->CreateBlock(txns, scriptPubKey);
     std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
-    Assert(m_node.chainman)->ProcessNewBlock(shared_pblock, true, true, nullptr);
+    FlushResult<void, AbortFailure> process_result;
+    (void)Assert(m_node.chainman)->ProcessNewBlock(shared_pblock, true, true, nullptr, process_result);
+    Assert(process_result);
 
     return block;
 }
@@ -548,9 +564,9 @@ CMutableTransaction TestChain100Setup::CreateValidMempoolTransaction(const std::
     CMutableTransaction mempool_txn = CreateValidTransaction(input_transactions, inputs, input_height, input_signing_keys, outputs, std::nullopt, std::nullopt).first;
     // If submit=true, add transaction to the mempool.
     if (submit) {
-        LOCK(cs_main);
-        const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(MakeTransactionRef(mempool_txn));
+        auto [result, flush_result]{ProcessTransaction(MakeTransactionRef(mempool_txn), m_node)};
         assert(result.m_result_type == MempoolAcceptResult::ResultType::VALID);
+        Assert(flush_result);
     }
     return mempool_txn;
 }
@@ -607,7 +623,7 @@ std::vector<CTransactionRef> TestChain100Setup::PopulateMempool(FastRandomContex
             LockPoints lp;
             auto changeset = m_node.mempool->GetChangeSet();
             changeset->StageAddition(ptx, /*fee=*/(total_in - num_outputs * amount_per_output),
-                    /*time=*/0, /*entry_height=*/1, /*entry_sequence=*/0,
+                    /*time=*/{}, /*entry_height=*/1, /*entry_sequence=*/0,
                     /*spends_coinbase=*/false, /*sigops_cost=*/4, lp);
             if (changeset->CheckMemPoolPolicyLimits()) {
                 changeset->Apply();
@@ -640,6 +656,10 @@ std::vector<CTransactionRef> TestChain100Setup::PopulateMempool(FastRandomContex
 
 SocketTestingSetup::SocketTestingSetup()
 {
+    // HTTPServer is not integrated into NodeContext yet and still pulls global args.
+    // This is the IP address DynSock claims to be from when connecting.
+    gArgs.ForceSetArg("-rpcallowip", "5.5.5.5");
+
     // "back up" the current CreateSock() so we can restore it after the test
     m_create_sock_orig = CreateSock;
 

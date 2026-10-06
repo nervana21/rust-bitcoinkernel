@@ -11,6 +11,7 @@
 #include <common/license_info.h>
 #include <common/system.h>
 #include <compat/compat.h>
+#include <crypto/sha256.h>
 #include <interfaces/init.h>
 #include <key.h>
 #include <logging.h>
@@ -96,6 +97,8 @@ MAIN_FUNCTION
 {
     ArgsManager& args = gArgs;
 
+    BCLog::Logger logger;
+
     int exit_status;
     std::unique_ptr<interfaces::Init> init = interfaces::MakeWalletInit(argc, argv, exit_status);
     if (!init) {
@@ -103,6 +106,7 @@ MAIN_FUNCTION
     }
 
     SetupEnvironment();
+    SHA256AutoDetect();
     RandomInit();
     try {
         if (const auto maybe_exit{WalletAppInit(args, argc, argv)}) return *maybe_exit;
