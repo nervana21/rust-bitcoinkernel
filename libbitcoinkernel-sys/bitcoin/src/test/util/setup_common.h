@@ -9,6 +9,7 @@
 #include <consensus/amount.h>
 #include <kernel/caches.h>
 #include <key.h>
+#include <logging.h>
 #include <node/caches.h>
 #include <node/context.h> // IWYU pragma: export
 #include <primitives/transaction.h>
@@ -38,7 +39,7 @@ extern const std::function<std::vector<const char*>()> G_TEST_COMMAND_LINE_ARGUM
 /** Retrieve the unit test name. */
 extern const std::function<std::string()> G_TEST_GET_FULL_NAME;
 
-static constexpr CAmount CENT{1000000};
+inline constexpr CAmount CENT{1'000'000};
 
 /** Register common test args. Shared across binaries that rely on the test framework. */
 void SetupCommonTestArgs(ArgsManager& argsman);
@@ -46,7 +47,6 @@ void SetupCommonTestArgs(ArgsManager& argsman);
 struct TestOpts {
     std::vector<const char*> extra_args{};
     bool coins_db_in_memory{true};
-    bool block_tree_db_in_memory{true};
     bool setup_net{true};
     bool setup_validation_interface{true};
     bool min_validation_cache{false}; // Equivalent of -maxsigcachebytes=0
@@ -56,6 +56,7 @@ struct TestOpts {
  * This just configures logging, data dir and chain parameters.
  */
 struct BasicTestingSetup {
+    BCLog::Logger m_logger;
     util::SignalInterrupt m_interrupt;
     node::NodeContext m_node; // keep as first member to be destructed last
 
@@ -100,11 +101,14 @@ struct BasicTestingSetup {
 struct ChainTestingSetup : public BasicTestingSetup {
     kernel::CacheSizes m_kernel_cache_sizes{node::CalculateCacheSizes(m_args).kernel};
     bool m_coins_db_in_memory{true};
-    bool m_block_tree_db_in_memory{true};
     std::function<void()> m_make_chainman{};
 
     explicit ChainTestingSetup(ChainType chainType = ChainType::MAIN, TestOpts = {});
     ~ChainTestingSetup();
+
+    //! Create the block template manager. Must be destroyed before resetting
+    //! any of its dependencies.
+    void CreateBlockTemplateManager();
 
     // Supplies a chainstate, if one is needed
     void LoadVerifyActivateChainstate();

@@ -206,6 +206,7 @@ struct OverlayFetchScope
 
 // Reuse a single global thread pool across fuzz iterations. Creating and destroying a pool every
 // iteration leaks memory, since iterations can run faster than the OS can tear down the threads.
+BasicTestingSetup* g_setup;
 std::shared_ptr<ThreadPool> g_thread_pool{std::make_shared<ThreadPool>("cache_fuzz")};
 
 void StartPoolIfNeeded()
@@ -213,9 +214,15 @@ void StartPoolIfNeeded()
     if (!g_thread_pool->WorkersCount()) g_thread_pool->Start(DEFAULT_PREVOUTFETCH_THREADS);
 }
 
+static void cleanup_coinscache_sim()
+{
+    // Stop worker threads before logger is destroyed because they log when exiting.
+    g_thread_pool->Stop();
+}
+
 } // namespace
 
-FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<>()}; })
+FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<BasicTestingSetup>()}; g_setup = setup.get(); }, .cleanup = cleanup_coinscache_sim)
 {
     SeedRandomStateForTest(SeedRand::ZEROS);
     StartPoolIfNeeded();
@@ -226,8 +233,8 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
     CoinsViewBottom bottom;
     /** Real CCoinsViewCache objects. */
     std::vector<std::unique_ptr<CCoinsViewCache>> caches;
-    /** Long-lived StartFetching guard (nullptr unless corresponding level is a CoinsViewOverlay). */
-    std::unique_ptr<OverlayFetchScope> overlay_fetch_scope;
+    /** Long-lived StartFetching guards, parallel to `caches` (entries are nullptr unless corresponding level is a CoinsViewOverlay). */
+    std::vector<std::unique_ptr<OverlayFetchScope>> fetch_scopes;
     /** Simulated cache data (sim_caches[0] matches bottom, sim_caches[i+1] matches caches[i]). */
     CacheLevel sim_caches[MAX_CACHES + 1];
     /** Current height in the simulation. */
@@ -265,6 +272,12 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
         }
     };
 
+    /** Helper creating a fetch scope for the top cache (which must be a CoinsViewOverlay). */
+    const auto make_fetch_scope{[&] {
+        auto& overlay{static_cast<CoinsViewOverlay&>(*caches.back())};
+        return std::make_unique<OverlayFetchScope>(overlay, data.block);
+    }};
+
     // Main simulation loop: read commands from the fuzzer input, and apply them
     // to both the real cache stack and the simulation.
     FuzzedDataProvider provider(buffer.data(), buffer.size());
@@ -275,8 +288,10 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
         // Make sure there is always at least one CCoinsViewCache.
         if (caches.empty()) {
             caches.emplace_back(new CCoinsViewCache(&bottom, /*deterministic=*/true));
+            fetch_scopes.emplace_back();
             sim_caches[caches.size()].Wipe();
         }
+        assert(caches.size() == fetch_scopes.size());
 
         // Execute command.
         CallOneOf(
@@ -403,17 +418,13 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
 
             [&]() { // Add a cache level (if not already at the max).
                 if (caches.size() != MAX_CACHES) {
-                    if (overlay_fetch_scope) {
-                        overlay_fetch_scope.reset();
-                        sim_caches[caches.size()].Wipe();
-                    }
                     // Apply to real caches.
                     if (provider.ConsumeBool()) {
                         caches.emplace_back(new CCoinsViewCache(&*caches.back(), /*deterministic=*/true));
+                        fetch_scopes.emplace_back();
                     } else {
-                        caches.emplace_back(new CoinsViewOverlay(&*caches.back(), g_thread_pool, /*deterministic=*/true));
-                        auto& overlay{static_cast<CoinsViewOverlay&>(*caches.back())};
-                        overlay_fetch_scope = std::make_unique<OverlayFetchScope>(overlay, data.block);
+                        caches.emplace_back(new CoinsViewOverlay(g_setup->m_logger, &*caches.back(), g_thread_pool, /*deterministic=*/true));
+                        fetch_scopes.emplace_back(make_fetch_scope());
                     }
                     // Apply to simulation data.
                     sim_caches[caches.size()].Wipe();
@@ -423,7 +434,7 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
             [&]() { // Remove a cache level.
                 // Apply to real caches (this reduces caches.size(), implicitly doing the same on the simulation data).
                 caches.back()->SanityCheck();
-                overlay_fetch_scope.reset();
+                fetch_scopes.pop_back();
                 caches.pop_back();
             },
 
@@ -440,7 +451,7 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
             },
 
             [&]() { // Sync.
-                if (overlay_fetch_scope) return; // CoinsViewOverlay::Sync() is never called in production
+                if (fetch_scopes.back()) return; // CoinsViewOverlay::Sync() is never called in production
                 // Apply to simulation data (note that in our simulation, syncing and flushing is the same thing).
                 flush();
                 // Apply to real caches.
@@ -450,10 +461,9 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
             [&]() { // Reset.
                 sim_caches[caches.size()].Wipe();
                 // Apply to real caches. Optionally start fetching again.
-                if (overlay_fetch_scope && provider.ConsumeBool()) {
-                    overlay_fetch_scope.reset();
-                    auto& overlay{static_cast<CoinsViewOverlay&>(*caches.back())};
-                    overlay_fetch_scope = std::make_unique<OverlayFetchScope>(overlay, data.block);
+                if (fetch_scopes.back() && provider.ConsumeBool()) {
+                    fetch_scopes.back().reset(); // Stop fetching before starting again.
+                    fetch_scopes.back() = make_fetch_scope();
                 } else {
                     (void)caches.back()->CreateResetGuard();
                 }
@@ -514,4 +524,7 @@ FUZZ_TARGET(coinscache_sim, .init = [] { static auto setup{MakeNoLogFileContext<
             assert(realcoin->nHeight == sim->second);
         }
     }
+
+    // Tear down the fetch scopes top down. Otherwise lower level could reset while upper level is reading from it.
+    while (!fetch_scopes.empty()) fetch_scopes.pop_back();
 }

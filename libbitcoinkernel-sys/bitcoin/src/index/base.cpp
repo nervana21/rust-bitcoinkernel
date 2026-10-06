@@ -10,6 +10,7 @@
 #include <interfaces/chain.h>
 #include <interfaces/types.h>
 #include <kernel/types.h>
+#include <logging.h>
 #include <node/abort.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
@@ -22,7 +23,6 @@
 #include <undo.h>
 #include <util/check.h>
 #include <util/fs.h>
-#include <util/log.h>
 #include <util/string.h>
 #include <util/thread.h>
 #include <util/threadinterrupt.h>
@@ -66,7 +66,7 @@ CBlockLocator GetLocator(interfaces::Chain& chain, const uint256& block_hash)
 }
 
 BaseIndex::DB::DB(const fs::path& path, size_t n_cache_size, bool f_memory, bool f_wipe, bool f_obfuscate, bool f_bloom) :
-    CDBWrapper{DBParams{
+    CDBWrapper{LogInstance(), DBParams{
         .path = path,
         .cache_bytes = n_cache_size,
         .memory_only = f_memory,
@@ -504,9 +504,9 @@ void BaseIndex::SetBestBlockIndex(const CBlockIndex* block)
 {
     assert(!m_chainstate->m_blockman.IsPruneMode() || AllowPrune());
 
-    if (AllowPrune() && block) {
+    if (AllowPrune()) {
         node::PruneLockInfo prune_lock;
-        prune_lock.height_first = block->nHeight;
+        prune_lock.height_first = block ? block->nHeight : 0;
         WITH_LOCK(::cs_main, m_chainstate->m_blockman.UpdatePruneLock(GetName(), prune_lock));
     }
 

@@ -31,6 +31,9 @@
 
 class CTxMemPool;
 
+using kernel::AbortFailure;
+using kernel::FlushResult;
+
 BOOST_FIXTURE_TEST_SUITE(validation_chainstate_tests, ChainTestingSetup)
 
 //! Test resizing coins-related Chainstate caches during runtime.
@@ -38,10 +41,13 @@ BOOST_FIXTURE_TEST_SUITE(validation_chainstate_tests, ChainTestingSetup)
 BOOST_AUTO_TEST_CASE(validation_chainstate_resize_caches)
 {
     ChainstateManager& manager = *Assert(m_node.chainman);
-    CTxMemPool& mempool = *Assert(m_node.mempool);
-    Chainstate& c1 = WITH_LOCK(cs_main, return manager.InitializeChainstate(&mempool));
+    Chainstate& c1 = WITH_LOCK(cs_main, return manager.InitializeChainstate());
     c1.InitCoinsDB(
-        /*cache_size_bytes=*/8_MiB, /*in_memory=*/true, /*should_wipe=*/false);
+        /*cache_size_bytes=*/8_MiB,
+        /*in_memory=*/true,
+        /*should_wipe=*/false,
+        /*coins_db=*/manager.m_options.coins_db,
+        /*coins_view=*/manager.m_options.coins_view);
     WITH_LOCK(::cs_main, c1.InitCoinsCache(8_MiB));
     BOOST_REQUIRE(manager.LoadGenesisBlock()); // Need at least one block loaded to be able to flush caches
 
@@ -56,18 +62,18 @@ BOOST_AUTO_TEST_CASE(validation_chainstate_resize_caches)
 
         BOOST_CHECK(c1.CoinsTip().HaveCoinInCache(outpoint));
 
-        c1.ResizeCoinsCaches(
+        BOOST_CHECK(c1.ResizeCoinsCaches(
             16_MiB, // upsizing the coinsview cache
             4_MiB // downsizing the coinsdb cache
-        );
+        ));
 
         // View should still have the coin cached, since we haven't destructed the cache on upsize.
         BOOST_CHECK(c1.CoinsTip().HaveCoinInCache(outpoint));
 
-        c1.ResizeCoinsCaches(
+        BOOST_CHECK(c1.ResizeCoinsCaches(
             4_MiB, // downsizing the coinsview cache
             8_MiB // upsizing the coinsdb cache
-        );
+        ));
 
         // The view cache should be empty since we had to destruct to downsize.
         BOOST_CHECK(!c1.CoinsTip().HaveCoinInCache(outpoint));
@@ -91,7 +97,9 @@ BOOST_FIXTURE_TEST_CASE(connect_tip_does_not_cache_inputs_on_failed_connect, Tes
 
     const auto tip{WITH_LOCK(cs_main, return chainstate.m_chain.Tip()->GetBlockHash())};
     const CBlock block{CreateBlock({tx}, CScript{} << OP_TRUE)};
-    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(block), true, true, nullptr));
+    FlushResult<void, AbortFailure> process_result;
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(block), true, true, nullptr, process_result));
+    BOOST_CHECK(process_result);
 
     LOCK(cs_main);
     BOOST_CHECK_EQUAL(tip, chainstate.m_chain.Tip()->GetBlockHash()); // block rejected
@@ -153,16 +161,17 @@ BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)
     // TODO: much of this is inlined from ProcessNewBlock(); just reuse PNB()
     // once it is changed to support multiple chainstates.
     {
-        LOCK(::cs_main);
-        bool checked = CheckBlock(*pblockone, state, chainparams.GetConsensus());
+        bool checked = WITH_LOCK(cs_main, return CheckBlock(*pblockone, state, chainparams.GetConsensus()));
         BOOST_CHECK(checked);
+        FlushResult<void, AbortFailure> accept_result;
         bool accepted = chainman.AcceptBlock(
-            pblockone, state, &pindex, true, nullptr, &newblock, true);
+            pblockone, state, accept_result, &pindex, true, nullptr, &newblock, true);
         BOOST_CHECK(accepted);
+        BOOST_CHECK(accept_result);
     }
 
     // UpdateTip is called here
-    bool block_added = background_cs.ActivateBestChain(state, pblockone);
+    auto block_added{background_cs.ActivateBestChain(state, pblockone)};
 
     // Ensure tip is as expected
     BOOST_CHECK_EQUAL(background_cs.m_chain.Tip()->GetBlockHash(), pblockone->GetHash());

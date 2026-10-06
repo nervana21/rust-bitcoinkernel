@@ -5,8 +5,9 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <consensus/params.h>
-#include <interfaces/mining.h>
 #include <net_processing.h>
+#include <node/block_template_manager.h>
+#include <node/miner.h>
 #include <pow.h>
 #include <primitives/block.h>
 #include <protocol.h>
@@ -22,6 +23,10 @@
 #include <cstdint>
 #include <memory>
 
+using kernel::AbortFailure;
+using kernel::FlushResult;
+
+
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
 
 /** Window, in blocks, for connecting to NODE_NETWORK_LIMITED peers */
@@ -31,14 +36,16 @@ static void mineBlock(node::NodeContext& node, FakeNodeClock& clock, std::chrono
 {
     auto curr_time = GetTime<std::chrono::seconds>();
     clock.set(block_time); // update time so the block is created with it
-    auto mining{interfaces::MakeMining(node)};
-    auto block_template{mining->createNewBlock({}, /*cooldown=*/false)};
+    auto& block_template_manager{*Assert(node.block_template_manager)};
+    auto block_template{block_template_manager.CreateNewTemplate({})};
     BOOST_REQUIRE(block_template);
-    CBlock block{block_template->getBlock()};
+    CBlock block{block_template->block};
     while (!CheckProofOfWork(block.GetHash(), block.nBits, node.chainman->GetConsensus())) ++block.nNonce;
     block.fChecked = true; // little speedup
     clock.set(curr_time); // process block at current time
-    Assert(node.chainman->ProcessNewBlock(std::make_shared<const CBlock>(block), /*force_processing=*/true, /*min_pow_checked=*/true, nullptr));
+    FlushResult<void, AbortFailure> process_result;
+    Assert(node.chainman->ProcessNewBlock(std::make_shared<const CBlock>(block), /*force_processing=*/true, /*min_pow_checked=*/true, nullptr, process_result));
+    Assert(process_result);
     node.validation_signals->SyncWithValidationInterfaceQueue(); // drain events queue
 }
 
