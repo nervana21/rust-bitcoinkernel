@@ -62,7 +62,8 @@ use libbitcoinkernel_sys::{
     btck_chain_parameters_create, btck_chain_parameters_create_signet,
     btck_chain_parameters_destroy, btck_context_create, btck_context_destroy,
     btck_context_interrupt, btck_context_options_create, btck_context_options_destroy,
-    btck_context_options_set_chainparams, btck_context_options_set_notifications,
+    btck_context_options_set_chainparams, btck_context_options_set_logger,
+    btck_context_options_set_notifications,
     btck_context_options_set_validation_interface,
 };
 
@@ -365,6 +366,7 @@ pub struct ContextBuilder {
     inner: *mut btck_ContextOptions,
     notification_registry: Option<NotificationCallbackRegistry>,
     validation_registry: Option<ValidationCallbackRegistry>,
+    logger: Option<*mut libbitcoinkernel_sys::btck_LoggingConnection>,
 }
 
 impl Default for ContextBuilder {
@@ -392,7 +394,16 @@ impl ContextBuilder {
             inner: unsafe { btck_context_options_create() },
             notification_registry: None,
             validation_registry: None,
+            logger: None,
         }
+    }
+
+    /// Attach a logging connection to contexts built from these options.
+    ///
+    /// The [`crate::Logger`] must outlive the resulting [`Context`].
+    pub fn logger(mut self, logger: &crate::Logger) -> Self {
+        self.logger = Some(logger.inner);
+        self
     }
 
     /// Consumes the builder and creates a [`Context`].
@@ -419,6 +430,11 @@ impl ContextBuilder {
         }
         if let Some(registry) = self.validation_registry.take() {
             self.setup_validation_interface(registry);
+        }
+        if let Some(logging_connection) = self.logger {
+            unsafe {
+                btck_context_options_set_logger(self.inner, logging_connection);
+            }
         }
 
         let inner = unsafe { btck_context_create(self.inner) };

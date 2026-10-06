@@ -71,12 +71,17 @@ pub const btck_LogCategory_RAND: btck_LogCategory = 7;
 pub const btck_LogCategory_REINDEX: btck_LogCategory = 8;
 pub const btck_LogCategory_VALIDATION: btck_LogCategory = 9;
 pub const btck_LogCategory_KERNEL: btck_LogCategory = 10;
+pub const btck_LogCategory_TXPACKAGES: btck_LogCategory = 11;
+pub const btck_LogCategory_LOCK: btck_LogCategory = 12;
+pub const btck_LogCategory_UNKNOWN: btck_LogCategory = 13;
 
 // btck_LogLevel
 
 pub const btck_LogLevel_TRACE: btck_LogLevel = 0;
 pub const btck_LogLevel_DEBUG: btck_LogLevel = 1;
 pub const btck_LogLevel_INFO: btck_LogLevel = 2;
+pub const btck_LogLevel_WARNING: btck_LogLevel = 3;
+pub const btck_LogLevel_ERROR: btck_LogLevel = 4;
 
 // btck_ScriptVerificationFlags
 
@@ -235,8 +240,25 @@ pub struct btck_WitnessStack {
 
 pub type btck_DestroyCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 
+#[repr(C)]
+pub struct btck_LogEntry {
+    pub message: *const c_char,
+    pub message_len: usize,
+    pub thread_name: *const c_char,
+    pub thread_name_len: usize,
+    pub timestamp_ns: i64,
+    pub mocktime_s: i64,
+    pub file_name: *const c_char,
+    pub file_name_len: usize,
+    pub function_name: *const c_char,
+    pub function_name_len: usize,
+    pub line: u32,
+    pub level: btck_LogLevel,
+    pub category: btck_LogCategory,
+}
+
 pub type btck_LogCallback =
-    unsafe extern "C" fn(user_data: *mut c_void, message: *const c_char, message_len: usize);
+    unsafe extern "C" fn(user_data: *mut c_void, entry: *const btck_LogEntry);
 
 pub type btck_NotifyBlockTip = Option<
     unsafe extern "C" fn(
@@ -326,15 +348,6 @@ pub type btck_WriteBytes =
 // Field order must match C exactly - sizes verified by const assertions below
 
 #[repr(C)]
-pub struct btck_LoggingOptions {
-    pub log_timestamps: c_int,
-    pub log_time_micros: c_int,
-    pub log_threadnames: c_int,
-    pub log_sourcelocations: c_int,
-    pub always_print_category_levels: c_int,
-}
-
-#[repr(C)]
 pub struct btck_NotificationInterfaceCallbacks {
     pub user_data: *mut c_void,
     pub user_data_destroy: btck_DestroyCallback,
@@ -361,8 +374,6 @@ pub struct btck_ValidationInterfaceCallbacks {
 // Pointer-sized fields use size_of::<*const ()>() to remain correct on both
 // 32-bit and 64-bit targets.
 const _: () = {
-    assert!(core::mem::size_of::<btck_LoggingOptions>() == 20);
-    assert!(core::mem::align_of::<btck_LoggingOptions>() == 4);
     assert!(
         core::mem::size_of::<btck_NotificationInterfaceCallbacks>()
             == 9 * core::mem::size_of::<*const ()>()
@@ -518,15 +529,10 @@ extern "C" {
 
     // --- Logging ------------------------------------------------------------
 
-    pub fn btck_logging_disable();
-
-    pub fn btck_logging_set_options(options: btck_LoggingOptions);
-
-    pub fn btck_logging_set_level_category(category: btck_LogCategory, level: btck_LogLevel);
-
-    pub fn btck_logging_enable_category(category: btck_LogCategory);
-
-    pub fn btck_logging_disable_category(category: btck_LogCategory);
+    pub fn btck_logging_set_min_level(
+        logging_connection: *mut btck_LoggingConnection,
+        level: btck_LogLevel,
+    );
 
     #[must_use]
     pub fn btck_logging_connection_create(
@@ -577,6 +583,11 @@ extern "C" {
     pub fn btck_context_options_set_validation_interface(
         context_options: *mut btck_ContextOptions,
         validation_interface_callbacks: btck_ValidationInterfaceCallbacks,
+    );
+
+    pub fn btck_context_options_set_logger(
+        context_options: *mut btck_ContextOptions,
+        logging_connection: *mut btck_LoggingConnection,
     );
 
     pub fn btck_context_options_destroy(context_options: *mut btck_ContextOptions);

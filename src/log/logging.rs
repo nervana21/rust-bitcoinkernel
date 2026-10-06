@@ -1,14 +1,14 @@
-use std::ffi::{c_char, c_void};
+use std::ffi::c_void;
 
 use libbitcoinkernel_sys::{
     btck_LogCategory, btck_LogCategory_ALL, btck_LogCategory_BENCH, btck_LogCategory_BLOCKSTORAGE,
     btck_LogCategory_COINDB, btck_LogCategory_KERNEL, btck_LogCategory_LEVELDB,
-    btck_LogCategory_MEMPOOL, btck_LogCategory_PRUNE, btck_LogCategory_RAND,
-    btck_LogCategory_REINDEX, btck_LogCategory_VALIDATION, btck_LogLevel, btck_LogLevel_DEBUG,
-    btck_LogLevel_INFO, btck_LogLevel_TRACE, btck_LoggingConnection, btck_LoggingOptions,
-    btck_logging_connection_create, btck_logging_connection_destroy, btck_logging_disable,
-    btck_logging_disable_category, btck_logging_enable_category, btck_logging_set_level_category,
-    btck_logging_set_options,
+    btck_LogCategory_LOCK, btck_LogCategory_MEMPOOL, btck_LogCategory_PRUNE, btck_LogCategory_RAND,
+    btck_LogCategory_REINDEX, btck_LogCategory_TXPACKAGES, btck_LogCategory_UNKNOWN,
+    btck_LogCategory_VALIDATION, btck_LogEntry, btck_LogLevel, btck_LogLevel_DEBUG,
+    btck_LogLevel_ERROR, btck_LogLevel_INFO, btck_LogLevel_TRACE, btck_LogLevel_WARNING,
+    btck_LoggingConnection, btck_logging_connection_create, btck_logging_connection_destroy,
+    btck_logging_set_min_level,
 };
 
 use crate::{ffi::c_helpers, KernelError};
@@ -20,10 +20,13 @@ pub trait Log {
 
 unsafe extern "C" fn log_callback<T: Log + 'static>(
     user_data: *mut c_void,
-    message: *const c_char,
-    message_len: usize,
+    entry: *const btck_LogEntry,
 ) {
-    let message = unsafe { c_helpers::to_string(message, message_len) };
+    if entry.is_null() {
+        return;
+    }
+    let entry = &*entry;
+    let message = c_helpers::to_string(entry.message, entry.message_len);
     let log = user_data as *mut T;
     (*log).log(&message);
 }
@@ -34,12 +37,17 @@ unsafe extern "C" fn destroy_log_callback<T>(user_data: *mut c_void) {
     }
 }
 
-/// The logger object logs kernel log messages into a user-defined log function.
-/// Messages logged by the kernel before this object is created are buffered in
-/// a 1MB buffer. The kernel library internally uses a global logging instance.
+/// Delivers kernel log entries through a user callback.
+///
+/// Attach the logger to a [`crate::ContextBuilder`] with
+/// [`crate::ContextBuilder::logger`] so context work receives entries.
+/// The connection must outlive every context that uses it.
 pub struct Logger {
-    inner: *mut btck_LoggingConnection,
+    pub(crate) inner: *mut btck_LoggingConnection,
 }
+
+unsafe impl Send for Logger {}
+unsafe impl Sync for Logger {}
 
 impl Drop for Logger {
     fn drop(&mut self) {
@@ -49,67 +57,8 @@ impl Drop for Logger {
     }
 }
 
-/// Permanently disable logging and stop buffering.
-///
-/// # Warning
-///
-/// This should only be called once during the lifetime of the program.
-pub fn disable_logging() {
-    unsafe {
-        btck_logging_disable();
-    }
-}
-
-/// Set global logging options.
-///
-/// This changes global settings and will override settings for all existing
-/// Logger instances.
-pub fn set_logging_options(options: LoggingOptions) {
-    let c_options = btck_LoggingOptions {
-        log_timestamps: c_helpers::to_c_bool(options.log_timestamps),
-        log_time_micros: c_helpers::to_c_bool(options.log_time_micros),
-        log_threadnames: c_helpers::to_c_bool(options.log_threadnames),
-        log_sourcelocations: c_helpers::to_c_bool(options.log_sourcelocations),
-        always_print_category_levels: c_helpers::to_c_bool(options.always_print_category_levels),
-    };
-
-    unsafe {
-        btck_logging_set_options(c_options);
-    }
-}
-
-/// Options controlling the format of log messages.
-#[derive(Debug, Clone, Copy)]
-pub struct LoggingOptions {
-    /// Prepend a timestamp to log messages.
-    pub log_timestamps: bool,
-    /// Log timestamps in microsecond precision.
-    pub log_time_micros: bool,
-    /// Prepend the name of the thread to log messages.
-    pub log_threadnames: bool,
-    /// Prepend the source location to log messages.
-    pub log_sourcelocations: bool,
-    /// Always print category and log level.
-    pub always_print_category_levels: bool,
-}
-
-impl Default for LoggingOptions {
-    fn default() -> Self {
-        Self {
-            log_timestamps: true,
-            log_time_micros: false,
-            log_threadnames: false,
-            log_sourcelocations: false,
-            always_print_category_levels: false,
-        }
-    }
-}
-
 impl Logger {
     /// Create a new Logger with the specified callback.
-    ///
-    /// Note: Logging options should be set using the global `set_logging_options`
-    /// function before or after creating the Logger.
     pub fn new<T: Log + 'static>(log: T) -> Result<Logger, KernelError> {
         let log_ptr = Box::into_raw(Box::new(log));
 
@@ -133,78 +82,33 @@ impl Logger {
         Ok(Logger { inner })
     }
 
-    /// Create a new Logger with the specified callback and options.
-    ///
-    /// This is a convenience method that sets the global logging options
-    /// and then creates the Logger.
-    pub fn new_with_options<T: Log + 'static>(
-        log: T,
-        options: LoggingOptions,
-    ) -> Result<Logger, KernelError> {
-        set_logging_options(options);
-        Self::new(log)
-    }
-
-    /// Sets the logging level for a specific category.
-    ///
-    /// This changes a global setting and will override settings for all existing
-    /// Logger instances.
-    pub fn set_level_category(&self, category: LogCategory, level: LogLevel) {
+    /// Set the minimum log level for this connection. Entries below this level
+    /// are not delivered. Defaults to Info.
+    pub fn set_min_level(&self, level: LogLevel) {
         unsafe {
-            btck_logging_set_level_category(category.into(), level.into());
-        }
-    }
-
-    /// Enables logging for a specific category.
-    ///
-    /// This changes a global setting and will override settings for all existing
-    /// Logger instances.
-    pub fn enable_category(&self, category: LogCategory) {
-        unsafe {
-            btck_logging_enable_category(category.into());
-        }
-    }
-
-    /// Disables logging for a specific category.
-    ///
-    /// This changes a global setting and will override settings for all existing
-    /// Logger instances.
-    pub fn disable_category(&self, category: LogCategory) {
-        unsafe {
-            btck_logging_disable_category(category.into());
+            btck_logging_set_min_level(self.inner, level.into());
         }
     }
 }
 
 /// Logging categories for Bitcoin Kernel messages.
-///
-/// Controls which types of log messages are emitted by the kernel library.
-/// Categories can be combined to enable multiple types of logging simultaneously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum LogCategory {
-    /// All logging categories enabled
     All = btck_LogCategory_ALL,
-    /// Benchmark and performance logging
     Bench = btck_LogCategory_BENCH,
-    /// Block storage operations
     BlockStorage = btck_LogCategory_BLOCKSTORAGE,
-    /// Coin database operations
     CoinDb = btck_LogCategory_COINDB,
-    /// LevelDB operations
     LevelDb = btck_LogCategory_LEVELDB,
-    /// Memory pool operations
     Mempool = btck_LogCategory_MEMPOOL,
-    /// Block pruning operations
     Prune = btck_LogCategory_PRUNE,
-    /// Random number generation
     Rand = btck_LogCategory_RAND,
-    /// Block reindexing operations
     Reindex = btck_LogCategory_REINDEX,
-    /// Block and transaction validation
     Validation = btck_LogCategory_VALIDATION,
-    /// Kernel-specific operations
     Kernel = btck_LogCategory_KERNEL,
+    TxPackages = btck_LogCategory_TXPACKAGES,
+    Lock = btck_LogCategory_LOCK,
+    Unknown = btck_LogCategory_UNKNOWN,
 }
 
 impl From<LogCategory> for btck_LogCategory {
@@ -228,24 +132,23 @@ impl From<btck_LogCategory> for LogCategory {
             btck_LogCategory_REINDEX => LogCategory::Reindex,
             btck_LogCategory_VALIDATION => LogCategory::Validation,
             btck_LogCategory_KERNEL => LogCategory::Kernel,
+            btck_LogCategory_TXPACKAGES => LogCategory::TxPackages,
+            btck_LogCategory_LOCK => LogCategory::Lock,
+            btck_LogCategory_UNKNOWN => LogCategory::Unknown,
             _ => panic!("Unknown log category: {}", value),
         }
     }
 }
 
 /// Logging levels for controlling message verbosity.
-///
-/// Determines the minimum severity level of messages that will be logged.
-/// Higher levels include all messages from lower levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum LogLevel {
-    /// Detailed trace information for debugging
     Trace = btck_LogLevel_TRACE,
-    /// Debug information for development
     Debug = btck_LogLevel_DEBUG,
-    /// General informational messages
     Info = btck_LogLevel_INFO,
+    Warning = btck_LogLevel_WARNING,
+    Error = btck_LogLevel_ERROR,
 }
 
 impl From<LogLevel> for btck_LogLevel {
@@ -261,6 +164,8 @@ impl From<btck_LogLevel> for LogLevel {
             btck_LogLevel_TRACE => LogLevel::Trace,
             btck_LogLevel_DEBUG => LogLevel::Debug,
             btck_LogLevel_INFO => LogLevel::Info,
+            btck_LogLevel_WARNING => LogLevel::Warning,
+            btck_LogLevel_ERROR => LogLevel::Error,
             _ => panic!("Unknown log level: {}", value),
         }
     }
@@ -270,123 +175,45 @@ impl From<btck_LogLevel> for LogLevel {
 mod tests {
     use super::*;
 
-    // LogCategory tests
     #[test]
     fn test_log_category_conversions() {
-        let all = LogCategory::All;
-        let btck_all: btck_LogCategory = all.into();
-        let back_to_all: LogCategory = btck_all.into();
-        assert_eq!(all, back_to_all);
-
-        let bench = LogCategory::Bench;
-        let btck_bench: btck_LogCategory = bench.into();
-        let back_to_bench: LogCategory = btck_bench.into();
-        assert_eq!(bench, back_to_bench);
-
-        let block_storage = LogCategory::BlockStorage;
-        let btck_block_storage: btck_LogCategory = block_storage.into();
-        let back_to_block_storage: LogCategory = btck_block_storage.into();
-        assert_eq!(block_storage, back_to_block_storage);
-
-        let coin_db = LogCategory::CoinDb;
-        let btck_coin_db: btck_LogCategory = coin_db.into();
-        let back_to_coin_db: LogCategory = btck_coin_db.into();
-        assert_eq!(coin_db, back_to_coin_db);
-
-        let level_db = LogCategory::LevelDb;
-        let btck_level_db: btck_LogCategory = level_db.into();
-        let back_to_level_db: LogCategory = btck_level_db.into();
-        assert_eq!(level_db, back_to_level_db);
-
-        let mempool = LogCategory::Mempool;
-        let btck_mempool: btck_LogCategory = mempool.into();
-        let back_to_mempool: LogCategory = btck_mempool.into();
-        assert_eq!(mempool, back_to_mempool);
-
-        let prune = LogCategory::Prune;
-        let btck_prune: btck_LogCategory = prune.into();
-        let back_to_prune: LogCategory = btck_prune.into();
-        assert_eq!(prune, back_to_prune);
-
-        let rand = LogCategory::Rand;
-        let btck_rand: btck_LogCategory = rand.into();
-        let back_to_rand: LogCategory = btck_rand.into();
-        assert_eq!(rand, back_to_rand);
-
-        let reindex = LogCategory::Reindex;
-        let btck_reindex: btck_LogCategory = reindex.into();
-        let back_to_reindex: LogCategory = btck_reindex.into();
-        assert_eq!(reindex, back_to_reindex);
-
-        let validation = LogCategory::Validation;
-        let btck_validation: btck_LogCategory = validation.into();
-        let back_to_validation: LogCategory = btck_validation.into();
-        assert_eq!(validation, back_to_validation);
-
-        let kernel = LogCategory::Kernel;
-        let btck_kernel: btck_LogCategory = kernel.into();
-        let back_to_kernel: LogCategory = btck_kernel.into();
-        assert_eq!(kernel, back_to_kernel);
+        for cat in [
+            LogCategory::All,
+            LogCategory::Bench,
+            LogCategory::BlockStorage,
+            LogCategory::CoinDb,
+            LogCategory::LevelDb,
+            LogCategory::Mempool,
+            LogCategory::Prune,
+            LogCategory::Rand,
+            LogCategory::Reindex,
+            LogCategory::Validation,
+            LogCategory::Kernel,
+            LogCategory::TxPackages,
+            LogCategory::Lock,
+            LogCategory::Unknown,
+        ] {
+            let raw: btck_LogCategory = cat.into();
+            let back: LogCategory = raw.into();
+            assert_eq!(cat, back);
+        }
     }
 
-    #[test]
-    fn test_log_category_equality() {
-        assert_eq!(LogCategory::All, LogCategory::All);
-        assert_ne!(LogCategory::All, LogCategory::Bench);
-        assert_ne!(LogCategory::Validation, LogCategory::Kernel);
-    }
-
-    #[test]
-    fn test_log_category_clone() {
-        let validation = LogCategory::Validation;
-        let cloned = validation;
-        assert_eq!(validation, cloned);
-    }
-
-    // LogLevel tests
     #[test]
     fn test_log_level_conversions() {
-        let trace = LogLevel::Trace;
-        let btck_trace: btck_LogLevel = trace.into();
-        let back_to_trace: LogLevel = btck_trace.into();
-        assert_eq!(trace, back_to_trace);
-
-        let debug = LogLevel::Debug;
-        let btck_debug: btck_LogLevel = debug.into();
-        let back_to_debug: LogLevel = btck_debug.into();
-        assert_eq!(debug, back_to_debug);
-
-        let info = LogLevel::Info;
-        let btck_info: btck_LogLevel = info.into();
-        let back_to_info: LogLevel = btck_info.into();
-        assert_eq!(info, back_to_info);
+        for level in [
+            LogLevel::Trace,
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warning,
+            LogLevel::Error,
+        ] {
+            let raw: btck_LogLevel = level.into();
+            let back: LogLevel = raw.into();
+            assert_eq!(level, back);
+        }
     }
 
-    #[test]
-    fn test_log_level_equality() {
-        assert_eq!(LogLevel::Info, LogLevel::Info);
-        assert_ne!(LogLevel::Info, LogLevel::Debug);
-        assert_ne!(LogLevel::Debug, LogLevel::Trace);
-    }
-
-    #[test]
-    fn test_log_level_clone() {
-        let info = LogLevel::Info;
-        let cloned = info;
-        assert_eq!(info, cloned);
-    }
-
-    #[test]
-    fn test_logging_options_default() {
-        let options = LoggingOptions::default();
-        assert!(options.log_timestamps);
-        assert!(!options.log_time_micros);
-        assert!(!options.log_threadnames);
-        assert!(!options.log_sourcelocations);
-        assert!(!options.always_print_category_levels);
-    }
-
-    // Logger tests
     struct TestLog {
         messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
@@ -403,121 +230,18 @@ mod tests {
         let test_log = TestLog {
             messages: messages.clone(),
         };
-
-        let _logger = Logger::new(test_log);
-        assert!(_logger.is_ok());
+        let logger = Logger::new(test_log);
+        assert!(logger.is_ok());
     }
 
     #[test]
-    fn test_logger_creation_with_options() {
+    fn test_logger_set_min_level() {
         let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let test_log = TestLog {
             messages: messages.clone(),
         };
-
-        let options = LoggingOptions {
-            log_timestamps: true,
-            log_time_micros: true,
-            log_threadnames: true,
-            log_sourcelocations: false,
-            always_print_category_levels: true,
-        };
-
-        let _logger = Logger::new_with_options(test_log, options);
-        assert!(_logger.is_ok());
-    }
-
-    #[test]
-    fn test_logger_set_level_category() {
-        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let test_log = TestLog {
-            messages: messages.clone(),
-        };
-
         let logger = Logger::new(test_log).unwrap();
-        logger.set_level_category(LogCategory::Validation, LogLevel::Debug);
-        logger.set_level_category(LogCategory::Kernel, LogLevel::Info);
-    }
-
-    #[test]
-    fn test_logger_enable_category() {
-        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let test_log = TestLog {
-            messages: messages.clone(),
-        };
-
-        let logger = Logger::new(test_log).unwrap();
-        logger.enable_category(LogCategory::Validation);
-        logger.enable_category(LogCategory::Kernel);
-    }
-
-    #[test]
-    fn test_logger_disable_category() {
-        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let test_log = TestLog {
-            messages: messages.clone(),
-        };
-
-        let logger = Logger::new(test_log).unwrap();
-        logger.disable_category(LogCategory::Validation);
-        logger.disable_category(LogCategory::Kernel);
-    }
-
-    #[test]
-    fn test_all_log_categories() {
-        let categories = [
-            LogCategory::All,
-            LogCategory::Bench,
-            LogCategory::BlockStorage,
-            LogCategory::CoinDb,
-            LogCategory::LevelDb,
-            LogCategory::Mempool,
-            LogCategory::Prune,
-            LogCategory::Rand,
-            LogCategory::Reindex,
-            LogCategory::Validation,
-            LogCategory::Kernel,
-        ];
-
-        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let test_log = TestLog {
-            messages: messages.clone(),
-        };
-
-        let logger = Logger::new(test_log).unwrap();
-
-        for category in categories {
-            logger.enable_category(category);
-            logger.set_level_category(category, LogLevel::Debug);
-        }
-    }
-
-    #[test]
-    fn test_all_log_levels() {
-        let levels = [LogLevel::Trace, LogLevel::Debug, LogLevel::Info];
-
-        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let test_log = TestLog {
-            messages: messages.clone(),
-        };
-
-        let logger = Logger::new(test_log).unwrap();
-
-        for level in levels {
-            logger.set_level_category(LogCategory::Validation, level);
-        }
-    }
-
-    #[test]
-    fn test_global_set_logging_options() {
-        let options = LoggingOptions {
-            log_timestamps: false,
-            log_time_micros: true,
-            log_threadnames: true,
-            log_sourcelocations: true,
-            always_print_category_levels: false,
-        };
-
-        set_logging_options(options);
+        logger.set_min_level(LogLevel::Debug);
+        logger.set_min_level(LogLevel::Info);
     }
 }
