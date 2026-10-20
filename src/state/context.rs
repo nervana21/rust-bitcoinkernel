@@ -63,8 +63,7 @@ use libbitcoinkernel_sys::{
     btck_chain_parameters_destroy, btck_context_create, btck_context_destroy,
     btck_context_interrupt, btck_context_options_create, btck_context_options_destroy,
     btck_context_options_set_chainparams, btck_context_options_set_logger,
-    btck_context_options_set_notifications,
-    btck_context_options_set_validation_interface,
+    btck_context_options_set_notifications, btck_context_options_set_validation_interface,
 };
 
 use crate::{

@@ -622,7 +622,6 @@ impl ChainstateManagerBuilder {
         }
     }
 
-
     /// Configures the chainstate database to run entirely in memory.
     ///
     /// When enabled, the chainstate database (which stores the current UTXO set)
